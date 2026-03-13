@@ -3,6 +3,7 @@ Automated tests for Globant Data Engineering Challenge API.
 Covers: health check, CSV upload, batch insert, and metrics endpoints.
 """
 import io
+import os
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -11,9 +12,10 @@ from sqlalchemy.orm import sessionmaker
 from app.main import app
 from app.database import Base, get_db
 
-# ── Test DB setup (in-memory SQLite) ─────────────────────────────────────────
+# ── Test DB setup (file-based SQLite for test isolation) ─────────────────────
 
-TEST_DATABASE_URL = "sqlite://"  # pure in-memory
+TEST_DB_PATH = "./test_globant.db"
+TEST_DATABASE_URL = f"sqlite:///{TEST_DB_PATH}"
 
 test_engine = create_engine(
     TEST_DATABASE_URL,
@@ -30,14 +32,29 @@ def override_get_db():
         db.close()
 
 
+# Apply override globally
+app.dependency_overrides[get_db] = override_get_db
+
+
 @pytest.fixture(autouse=True)
-def setup_db():
-    """Create tables before each test and drop them after."""
+def reset_db():
+    """Drop and recreate all tables before each test for isolation."""
+    Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
-    app.dependency_overrides[get_db] = override_get_db
     yield
     Base.metadata.drop_all(bind=test_engine)
-    app.dependency_overrides.clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_db():
+    """Remove test DB file after all tests finish."""
+    yield
+    try:
+        test_engine.dispose()
+        if os.path.exists(TEST_DB_PATH):
+            os.remove(TEST_DB_PATH)
+    except Exception:
+        pass
 
 
 client = TestClient(app)
@@ -79,7 +96,6 @@ class TestCSVUpload:
         assert response.json()["rows_inserted"] == 3
 
     def test_upload_employees_csv(self):
-        # Pre-load departments & jobs first (foreign keys)
         client.post(
             "/upload/csv/departments",
             files=self._csv_file("1,Supply Chain\n2,Staff\n", "departments.csv"),
@@ -101,13 +117,11 @@ class TestCSVUpload:
 
     def test_upload_invalid_csv_returns_400(self):
         bad_content = "not,valid,csv,data,extra,columns\n!!!"
-        # Departments expect only 2 cols; pandas will still parse but ids won't be ints
         response = client.post(
             "/upload/csv/departments",
             files=self._csv_file(bad_content, "bad.csv"),
         )
-        # Should return 400 due to parsing error
-        assert response.status_code in (400, 201)  # graceful either way
+        assert response.status_code in (400, 201)
 
 
 # ── Batch Insert ──────────────────────────────────────────────────────────────
@@ -131,10 +145,8 @@ class TestBatchInsert:
         assert response.json()["rows_inserted"] == 2
 
     def test_batch_insert_employees(self):
-        # Pre-load reference data
         client.post("/upload/batch/departments", json={"rows": [{"id": 1, "department": "Staff"}]})
         client.post("/upload/batch/jobs", json={"rows": [{"id": 1, "job": "Recruiter"}]})
-
         payload = {
             "rows": [
                 {"id": 1, "name": "Alice", "datetime": "2021-03-10T08:00:00Z", "department_id": 1, "job_id": 1},
@@ -157,7 +169,6 @@ class TestBatchInsert:
     def test_batch_upsert_updates_existing_row(self):
         client.post("/upload/batch/departments", json={"rows": [{"id": 1, "department": "OldName"}]})
         client.post("/upload/batch/departments", json={"rows": [{"id": 1, "department": "NewName"}]})
-        # No error on duplicate PK — upsert should succeed
         response = client.post("/upload/batch/departments", json={"rows": [{"id": 1, "department": "FinalName"}]})
         assert response.status_code == 201
 
@@ -166,7 +177,6 @@ class TestBatchInsert:
 
 class TestMetrics:
     def _seed_data(self):
-        """Seed DB with enough data to test metric endpoints."""
         client.post("/upload/batch/departments", json={
             "rows": [
                 {"id": 1, "department": "Staff"},
@@ -182,19 +192,14 @@ class TestMetrics:
         })
         client.post("/upload/batch/employees", json={
             "rows": [
-                # Staff / Recruiter — Q1
-                {"id": 1,  "name": "E1",  "datetime": "2021-01-10T00:00:00Z", "department_id": 1, "job_id": 2},
-                {"id": 2,  "name": "E2",  "datetime": "2021-02-15T00:00:00Z", "department_id": 1, "job_id": 2},
-                {"id": 3,  "name": "E3",  "datetime": "2021-03-20T00:00:00Z", "department_id": 1, "job_id": 2},
-                # Staff / Manager — Q2
-                {"id": 4,  "name": "E4",  "datetime": "2021-04-10T00:00:00Z", "department_id": 1, "job_id": 1},
-                # Supply Chain / Manager — Q3
-                {"id": 5,  "name": "E5",  "datetime": "2021-07-05T00:00:00Z", "department_id": 2, "job_id": 1},
-                {"id": 6,  "name": "E6",  "datetime": "2021-08-20T00:00:00Z", "department_id": 2, "job_id": 1},
-                # Maintenance / Recruiter — Q4
-                {"id": 7,  "name": "E7",  "datetime": "2021-10-10T00:00:00Z", "department_id": 3, "job_id": 2},
-                # Non-2021 row (should NOT appear in results)
-                {"id": 8,  "name": "E8",  "datetime": "2020-06-01T00:00:00Z", "department_id": 1, "job_id": 1},
+                {"id": 1, "name": "E1", "datetime": "2021-01-10T00:00:00Z", "department_id": 1, "job_id": 2},
+                {"id": 2, "name": "E2", "datetime": "2021-02-15T00:00:00Z", "department_id": 1, "job_id": 2},
+                {"id": 3, "name": "E3", "datetime": "2021-03-20T00:00:00Z", "department_id": 1, "job_id": 2},
+                {"id": 4, "name": "E4", "datetime": "2021-04-10T00:00:00Z", "department_id": 1, "job_id": 1},
+                {"id": 5, "name": "E5", "datetime": "2021-07-05T00:00:00Z", "department_id": 2, "job_id": 1},
+                {"id": 6, "name": "E6", "datetime": "2021-08-20T00:00:00Z", "department_id": 2, "job_id": 1},
+                {"id": 7, "name": "E7", "datetime": "2021-10-10T00:00:00Z", "department_id": 3, "job_id": 2},
+                {"id": 8, "name": "E8", "datetime": "2020-06-01T00:00:00Z", "department_id": 1, "job_id": 1},
             ]
         })
 
@@ -224,7 +229,6 @@ class TestMetrics:
     def test_hires_by_quarter_excludes_non_2021(self):
         self._seed_data()
         rows = client.get("/metrics/hires-by-quarter").json()
-        # Employee 8 hired in 2020 — Staff/Manager Q2 should be 1, not 2
         staff_manager = next(
             (r for r in rows if r["department"] == "Staff" and r["job"] == "Manager"), None
         )
@@ -255,3 +259,4 @@ class TestMetrics:
         response = client.get("/metrics/above-mean-hires")
         assert response.status_code == 200
         assert response.json() == []
+
