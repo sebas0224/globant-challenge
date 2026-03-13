@@ -244,9 +244,3 @@ To switch from SQLite to PostgreSQL, change `DATABASE_URL` in `database.py`:
 ```python
 DATABASE_URL = "postgresql://user:password@host:5432/dbname"
 ```
-
----
-
-## 👤 Author
-
-Built for Globant's Data Engineering Coding Challenge.
